@@ -89,7 +89,7 @@ class DatabaseHandler:
         try:
             with open(path, 'r') as f: data = json.load(f)
             for d in data:
-                self.add_drama(d, d['status'], d['current_ep'])
+                self.add_drama(d, d['status'], d.get('current_ep', 0))
             return True
         except: return False
 

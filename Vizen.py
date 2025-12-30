@@ -15,8 +15,8 @@ from qfluentwidgets import (MSFluentWindow, NavigationItemPosition, TitleLabel,
 from api_handler import TMDBService
 from database import DatabaseHandler
 
-# --- GLOBALS & CONSTANTS ---
-CURRENT_VERSION = "1.2.2"
+# --- GLOBALS ---
+CURRENT_VERSION = "1.2.3"
 GITHUB_REPO = "xHashii/Vizen-Watchlist"
 IMAGE_CACHE = {}  
 AMOLED_MODE = False 
@@ -27,6 +27,9 @@ CACHE_DIR = os.path.join(os.environ['LOCALAPPDATA'], 'Vizen', 'Cache')
 if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
 
 # --- UTILS ---
+def qt_message_handler(mode, context, message):
+    if "setPointSize" in message or "pointSize" in message: return
+
 def resource_path(relative_path):
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
@@ -34,17 +37,91 @@ def resource_path(relative_path):
 def get_bg(): return "#000000" if AMOLED_MODE else "#1a1625"
 def get_card_bg(): return "#121212" if AMOLED_MODE else "#252033"
 
-def qt_message_handler(mode, context, message):
-    if "setPointSize" in message or "pointSize" in message: return
-
 def apply_font_guard(widget):
-    f = QFont("Segoe UI", 10)
-    f.setPixelSize(14)
+    f = QFont("Segoe UI", 10); f.setPixelSize(14)
     widget.setFont(f)
-    for child in widget.findChildren(QWidget):
-        child.setFont(f)
+    for child in widget.findChildren(QWidget): child.setFont(f)
 
-# --- WORKERS ---
+# --- UPDATER ENGINE (BULLETPROOF VERSION) ---
+
+class UpdateWorker(QThread):
+    finished = Signal(str)
+    progress = Signal(int)
+    
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            # Use a unique filename to avoid "File in use" errors
+            timestamp = int(time.time())
+            path = os.path.join(os.environ['TEMP'], f"Vizen_Setup_{timestamp}.exe")
+            
+            response = requests.get(self.url, stream=True, timeout=30)
+            total = int(response.headers.get('content-length', 0))
+            
+            dl = 0
+            with open(path, 'wb') as f:
+                for chunk in response.iter_content(8192):
+                    if chunk:
+                        dl += len(chunk)
+                        f.write(chunk)
+                        if total:
+                            self.progress.emit(int((dl / total) * 100))
+            
+            self.finished.emit(path)
+        except Exception as e:
+            print(f"Download failed: {e}")
+
+class UpdateChecker(QThread):
+    update_available = Signal(str, str) # version, url
+
+    def run(self):
+        try:
+            # Numerical comparison logic (1.2.10 > 1.2.2)
+            res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=10).json()
+            tag = res['tag_name']
+            remote_v_str = tag.replace('v', '')
+            
+            remote_v_map = list(map(int, remote_v_str.split('.')))
+            local_v_map = list(map(int, CURRENT_VERSION.split('.')))
+
+            if remote_v_map > local_v_map:
+                for asset in res['assets']:
+                    if asset['name'].endswith('.exe'):
+                        self.update_available.emit(remote_v_str, asset['browser_download_url'])
+                        return
+        except: pass
+
+# --- IMAGE ENGINE ---
+class ImageWorkerSignals(QObject): result = Signal(QImage, str)
+class ImageWorker(QRunnable):
+    def __init__(self, url, w, h):
+        super().__init__(); self.url, self.w, self.h = url, w, h
+        self.signals = ImageWorkerSignals()
+    def run(self):
+        if self.url in IMAGE_CACHE: self._safe_emit(IMAGE_CACHE[self.url]); return
+        url_hash = hashlib.md5(self.url.encode()).hexdigest()
+        cache_path = os.path.join(CACHE_DIR, f"{url_hash}.jpg")
+        img = QImage()
+        if os.path.exists(cache_path) and (time.time() - os.path.getmtime(cache_path)) < 1209600:
+            img.load(cache_path)
+        if img.isNull():
+            try:
+                resp = requests.get(self.url, timeout=7)
+                img.loadFromData(resp.content); img.save(cache_path, "JPG", 80)
+            except:
+                if os.path.exists(cache_path): img.load(cache_path)
+                else: return
+        if not img.isNull():
+            scaled = img.scaled(self.w, self.h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            IMAGE_CACHE[self.url] = scaled; self._safe_emit(scaled)
+    def _safe_emit(self, image):
+        try: self.signals.result.emit(image, self.url)
+        except RuntimeError: pass 
+
+# --- UI COMPONENTS ---
 class DetailWorker(QThread):
     finished = Signal(dict)
     def __init__(self, tmdb, tid): super().__init__(); self.tmdb, self.tid = tmdb, tid
@@ -52,126 +129,27 @@ class DetailWorker(QThread):
         res = self.tmdb.get_detailed_info(self.tid)
         if res: self.finished.emit(res)
 
-class UpdateWorker(QThread):
-    finished = Signal(str)
-    progress = Signal(int)
-    def __init__(self, url):
-        super().__init__(); self.url = url
-    def run(self):
-        try:
-            response = requests.get(self.url, stream=True)
-            total = int(response.headers.get('content-length', 0))
-            path = os.path.join(os.environ['TEMP'], "Vizen_Setup.exe")
-            dl = 0
-            with open(path, 'wb') as f:
-                for chunk in response.iter_content(4096):
-                    dl += len(chunk); f.write(chunk)
-                    if total: self.progress.emit(int((dl/total)*100))
-            self.finished.emit(path)
-        except: pass
-
-class UpdateChecker(QThread):
-    update_available = Signal(str, str)
-    def run(self):
-        try:
-            res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest").json()
-            new_v = res['tag_name'].replace('v', '')
-            if new_v > CURRENT_VERSION:
-                for a in res['assets']:
-                    if a['name'].endswith('.exe'):
-                        self.update_available.emit(new_v, a['browser_download_url']); break
-        except: pass
-
-# --- IMAGE ENGINE ---
-class ImageWorkerSignals(QObject): 
-    result = Signal(QImage, str)
-
-class ImageWorker(QRunnable):
-    def __init__(self, url, w, h):
-        super().__init__()
-        self.url, self.w, self.h = url, w, h
-        self.signals = ImageWorkerSignals()
-    
-    def run(self):
-        if self.url in IMAGE_CACHE: 
-            self._safe_emit(IMAGE_CACHE[self.url])
-            return
-        
-        url_hash = hashlib.md5(self.url.encode()).hexdigest()
-        cache_path = os.path.join(CACHE_DIR, f"{url_hash}.jpg")
-
-        img = QImage()
-        if os.path.exists(cache_path):
-            if (time.time() - os.path.getmtime(cache_path)) < 1209600:
-                img.load(cache_path)
-
-        if img.isNull():
-            try:
-                resp = requests.get(self.url, timeout=7)
-                img.loadFromData(resp.content)
-                img.save(cache_path, "JPG", 80)
-            except:
-                if os.path.exists(cache_path): img.load(cache_path)
-                else: return
-
-        if not img.isNull():
-            scaled = img.scaled(self.w, self.h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            IMAGE_CACHE[self.url] = scaled
-            self._safe_emit(scaled)
-
-    def _safe_emit(self, image):
-        try:
-            self.signals.result.emit(image, self.url)
-        except RuntimeError: pass 
-
-# --- UI COMPONENTS ---
-
 class InfoDialog(MessageBoxBase):
     def __init__(self, d, parent=None):
         super().__init__(parent)
         self.titleLabel = SubtitleLabel(d['title'], self)
         self.titleLabel.setStyleSheet("font-size: 22px; font-weight: bold; color: white; border: none;")
-        
         genres = " • ".join(d.get('genres', []))
         self.metaLabel = CaptionLabel(f"{d['year']}  •  {d['total_eps']} Episodes\n{genres}", self)
         self.metaLabel.setStyleSheet(f"color: {ACCENT_YELLOW}; font-weight: bold; font-size: 13px; border: none;")
-        
         self.content = TextBrowser(self)
         self.content.setMarkdown(f"**Cast:** {', '.join(d['cast'])}\n\n{d['overview']}")
         self.content.setFixedHeight(280)
         self.content.setStyleSheet("background: transparent; border: none; color: #d0d0d0; font-size: 14px;")
         self.content.setFrameStyle(QFrame.NoFrame) 
-        
-        self.viewLayout.addWidget(self.titleLabel)
-        self.viewLayout.addWidget(self.metaLabel)
-        self.viewLayout.addWidget(self.content)
-        
-        self.yesButton.setText("Close")
-        self.yesButton.setFixedWidth(120)
-        self.yesButton.setFocusPolicy(Qt.NoFocus)
-        self.yesButton.setStyleSheet(f"""
-            PushButton {{
-                background-color: #20f0ff;
-                color: black;
-                border: none;
-                border-radius: 8px;
-                font-weight: bold;
-                height: 32px;
-            }}
-            PushButton:hover {{ background-color: #1ad8e6; }}
-        """)
+        self.viewLayout.addWidget(self.titleLabel); self.viewLayout.addWidget(self.metaLabel); self.viewLayout.addWidget(self.content)
+        self.yesButton.setText("Close"); self.yesButton.setFixedWidth(120); self.yesButton.setFocusPolicy(Qt.NoFocus)
+        self.yesButton.setStyleSheet(f"PushButton {{ background-color: #20f0ff; color: black; border: none; border-radius: 8px; font-weight: bold; height: 32px; }} PushButton:hover {{ background-color: #1ad8e6; }}")
         self.cancelButton.hide()
-        
-        self.widget.setStyleSheet(f"""
-            QWidget {{ background-color: {get_card_bg()}; border: 1px solid {ACCENT_PINK}; border-radius: 12px; }}
-            #buttonGroup {{ border: none; background: transparent; }}
-        """)
-        
+        self.widget.setStyleSheet(f"QWidget {{ background-color: {get_card_bg()}; border: 1px solid {ACCENT_PINK}; border-radius: 12px; }} #buttonGroup {{ border: none; background: transparent; }}")
         for child in self.widget.findChildren(QFrame):
             if child.height() <= 3: child.hide()
-
-        self.viewLayout.setContentsMargins(25, 25, 25, 15)
-        apply_font_guard(self)
+        self.viewLayout.setContentsMargins(25, 25, 25, 15); apply_font_guard(self)
 
 class HeartRating(QWidget):
     valueChanged = Signal(int)
@@ -196,14 +174,11 @@ class DramaCard(CardWidget):
     def __init__(self, d, db, tmdb, parent=None, is_lib=False, on_refresh=None):
         super().__init__(parent=parent)
         self.db, self.tmdb, self.data, self.is_lib, self.on_refresh = db, tmdb, d, is_lib, on_refresh
-        self.setFixedSize(210, 520 if is_lib else 360); self.update_style()
-        self.setCursor(Qt.PointingHandCursor)
-        
+        self.setFixedSize(210, 520 if is_lib else 360); self.update_style(); self.setCursor(Qt.PointingHandCursor)
         l = QVBoxLayout(self); l.setContentsMargins(10,10,10,10); l.setSpacing(8)
         self.img = BodyLabel(self); self.img.setFixedSize(190, 260); self.img.setStyleSheet("border-radius:8px;background:#0d0d0d;")
         if d.get('poster'):
-            w = ImageWorker(d['poster'], 190, 260)
-            w.signals.result.connect(self._set_image_safe)
+            w = ImageWorker(d['poster'], 190, 260); w.signals.result.connect(self._set_image_safe)
             QThreadPool.globalInstance().start(w)
         l.addWidget(self.img)
         if is_lib:
@@ -230,13 +205,11 @@ class DramaCard(CardWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             clicked_widget = self.childAt(e.position().toPoint())
-            if clicked_widget in [self.img, self.title, None]: self.fetch_details()
+            if clicked_widget in [self.img, self.title, None]:
+                self.dw = DetailWorker(self.tmdb, self.data['id'])
+                self.dw.finished.connect(lambda d: InfoDialog(d, self.window()).exec())
+                self.dw.start()
         super().mousePressEvent(e)
-
-    def fetch_details(self):
-        self.dw = DetailWorker(self.tmdb, self.data['id'])
-        self.dw.finished.connect(lambda d: InfoDialog(d, self.window()).exec())
-        self.dw.start()
 
     def update_style(self): self.setStyleSheet(f"DramaCard{{background:{get_card_bg()};border:1px solid #333;border-radius:12px;}} DramaCard:hover{{border:1px solid {ACCENT_PINK};}}")
     def update_pb(self):
@@ -269,29 +242,35 @@ class DramaCard(CardWidget):
 class BaseInterface(QFrame):
     def __init__(self, db, tmdb, obj_name, parent=None):
         super().__init__(parent=parent); self.setObjectName(obj_name); self.db, self.tmdb = db, tmdb
+        
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(15, 30, 15, 80) 
+        self.main_layout.setContentsMargins(30, 30, 30, 30)
         self.main_layout.setSpacing(20)
+        
+        self.header_layout = QVBoxLayout()
+        self.main_layout.addLayout(self.header_layout)
         
         self.sa = SmoothScrollArea(self); self.sa.setWidgetResizable(True); self.sa.setStyleSheet("background:transparent;border:none;")
         self.container = QWidget(); self.container.setStyleSheet("background:transparent;")
         self.flow = FlowLayout(self.container); self.flow.setContentsMargins(0,0,0,0); self.flow.setHorizontalSpacing(12); self.flow.setVerticalSpacing(25)
+        self.sa.setWidget(self.container)
         
         self.emptyLabel = BodyLabel("No dramas found.", self) 
         self.emptyLabel.setAlignment(Qt.AlignCenter)
         self.emptyLabel.setStyleSheet("color: #666; font-size: 20px; font-weight: bold; background: transparent;")
         self.emptyLabel.hide()
         
-        self.main_layout.addWidget(self.emptyLabel, 0, Qt.AlignCenter)
-        self.main_layout.addWidget(self.sa)
+        self.main_layout.addWidget(self.emptyLabel, 1)
+        self.main_layout.addWidget(self.sa, 1)
+        
         self.queue = []; self.timer = QTimer(self); self.timer.timeout.connect(self.process)
 
     def start_loading(self, items, is_lib=False, cb=None):
         self.timer.stop(); self.queue = items; self.is_lib, self.cb = is_lib, cb
         while self.flow.count() > 0:
             it = self.flow.takeAt(0)
-            widget = it.widget() if hasattr(it, 'widget') else it
-            if widget: widget.deleteLater()
+            w = it.widget() if hasattr(it, 'widget') else it
+            if w: w.deleteLater()
         
         if not items:
             self.sa.hide()
@@ -299,7 +278,7 @@ class BaseInterface(QFrame):
         else:
             self.emptyLabel.hide()
             self.sa.show()
-        self.timer.start(5)
+            self.timer.start(5)
 
     def process(self):
         if not self.queue: self.timer.stop(); return
@@ -308,21 +287,29 @@ class BaseInterface(QFrame):
 class BrowseInterface(BaseInterface):
     def __init__(self, db, tmdb, parent=None):
         super().__init__(db, tmdb, "browseInterface", parent)
-        h = QHBoxLayout(); h.setContentsMargins(10,0,10,0); h.addWidget(TitleLabel("Browse Asian Dramas")); h.addStretch(1)
+        h = QHBoxLayout()
+        h.addWidget(TitleLabel("Browse Asian Dramas"))
+        h.addStretch(1)
         self.sb = SearchLineEdit(self); self.sb.setPlaceholderText("Search TMDB..."); self.sb.setFixedWidth(350)
-        self.sb.searchSignal.connect(self.search); self.sb.returnPressed.connect(lambda: self.search(self.sb.text()))
-        h.addWidget(self.sb); self.main_layout.insertLayout(0, h)
+        self.sb.searchSignal.connect(self.search)
+        self.sb.returnPressed.connect(lambda: self.search(self.sb.text()))
+        h.addWidget(self.sb)
+        self.header_layout.addLayout(h)
+
     def search(self, q):
         if q: self.start_loading(self.tmdb.search_dramas(q))
 
 class LibraryInterface(BaseInterface):
     def __init__(self, db, tmdb, parent=None):
         super().__init__(db, tmdb, "libraryInterface", parent)
-        h = QHBoxLayout(); h.setContentsMargins(10,0,10,0); h.addWidget(TitleLabel("My Library")); h.addStretch(1)
-        self.main_layout.insertLayout(0, h)
-        self.piv = SegmentedWidget(self); [self.piv.addItem(k, k.title().replace('Plan', 'Plan to Watch')) for k in ["all", "watching", "plan", "completed"]]
-        self.piv.setCurrentItem("all"); self.piv.currentItemChanged.connect(self.refresh); self.main_layout.insertWidget(1, self.piv, 0, Qt.AlignLeft)
-    
+        self.header_layout.addWidget(TitleLabel("My Library"))
+        self.piv = SegmentedWidget(self)
+        for k in ["all", "watching", "plan", "completed"]:
+            self.piv.addItem(k, k.title().replace('Plan', 'Plan to Watch'))
+        self.piv.setCurrentItem("all")
+        self.piv.currentItemChanged.connect(self.refresh)
+        self.header_layout.addWidget(self.piv, 0, Qt.AlignLeft)
+
     def refresh(self):
         status = self.piv.currentItem().text().replace('Plan to Watch', 'plan').lower()
         self.start_loading(self.db.get_library(status), True, self.refresh)
@@ -334,8 +321,7 @@ class LibraryInterface(BaseInterface):
     def import_json(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Backup", "", "JSON (*.json)")
         if path:
-            if self.db.import_data(path):
-                self.refresh(); InfoBar.success("Import Successful", "Library updated.", duration=3000, parent=self.window())
+            if self.db.import_data(path): self.refresh(); InfoBar.success("Import Successful", "Library updated.", duration=3000, parent=self.window())
             else: InfoBar.error("Import Failed", "Invalid JSON file.", duration=3000, parent=self.window())
 
 class SettingsInterface(SmoothScrollArea):
@@ -343,31 +329,25 @@ class SettingsInterface(SmoothScrollArea):
         super().__init__(parent=parent); self.db = db; self.setObjectName("settingsInterface")
         self.view = QWidget(); l = QVBoxLayout(self.view); l.setContentsMargins(30,30,30,30); l.setSpacing(20)
         self.setWidget(self.view); self.setWidgetResizable(True); self.setStyleSheet("background:transparent;border:none;")
-        
         g1 = SettingCardGroup("About", self.view); l.addWidget(g1)
         g1.addSettingCard(SettingCard(FIF.INFO, "Version", f"Current: {CURRENT_VERSION}"))
         c1 = PushSettingCard("Visit GitHub", FIF.PEOPLE, "Developer", "Made with ❤️ by Hashii")
         c1.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{GITHUB_REPO}"))); g1.addSettingCard(c1)
-        
         g2 = SettingCardGroup("API Settings", self.view); l.addWidget(g2)
         c2 = PushSettingCard("Update", FIF.VPN, "Custom TMDB Key", "Use your own key if the default is slow")
         c2.clicked.connect(self.change_key); g2.addSettingCard(c2)
-        
         g3 = SettingCardGroup("Personalization", self.view); l.addWidget(g3)
         c3 = SwitchSettingCard(FIF.BRUSH, "AMOLED Mode", "Pure black background")
         c3.switchButton.setChecked(AMOLED_MODE); c3.checkedChanged.connect(self.toggle_amoled); g3.addSettingCard(c3)
-        
         g4 = SettingCardGroup("Data & Backup", self.view); l.addWidget(g4)
         i, e, c = PushSettingCard("Import", FIF.UP, "Import Backup", "Load JSON"), PushSettingCard("Export", FIF.DOWNLOAD, "Export Backup", "Save JSON"), PushSettingCard("Clear", FIF.DELETE, "Clear Cache", "Free RAM")
         i.clicked.connect(lambda: self.window().library.import_json())
         e.clicked.connect(lambda: self.window().library.export_data())
         c.clicked.connect(self.clear_cache)
         [g4.addSettingCard(x) for x in [i, e, c]]; l.addStretch(1)
-
     def toggle_amoled(self, c): global AMOLED_MODE; AMOLED_MODE = c; self.window().apply_theme()
     def clear_cache(self): 
-        global IMAGE_CACHE
-        IMAGE_CACHE.clear()
+        global IMAGE_CACHE; IMAGE_CACHE.clear()
         for f in os.listdir(CACHE_DIR): 
             try: os.remove(os.path.join(CACHE_DIR, f))
             except: pass
@@ -393,20 +373,51 @@ class VizenWindow(MSFluentWindow):
         self.setWindowTitle("Vizen Watchlist"); self.resize(1300, 850); self.center(); self.apply_theme()
         self.stackedWidget.currentChanged.connect(lambda i: self.library.refresh() if i==1 else None)
         self.check_updates()
+
     def center(self):
         cp = QApplication.primaryScreen().availableGeometry().center()
         qr = self.frameGeometry(); qr.moveCenter(cp); self.move(qr.topLeft())
+
     def apply_theme(self):
         bg = get_bg(); self.setStyleSheet(f"MSFluentWindow, QStackedWidget {{ background: {bg}; }}")
         [x.setStyleSheet(f"background:{bg};border:none;") for x in [self.browse, self.library, self.settings.view]]
         for c in self.findChildren(DramaCard): c.update_style()
+
     def check_updates(self):
         self.checker = UpdateChecker(self); self.checker.update_available.connect(self.prompt_update); self.checker.start()
-    def prompt_update(self, v, u):
-        if MessageBox("Update Found! 🚀", f"Version {v} is available. Install now?", self).exec():
-            self.dlg = MessageBox("Downloading...", "Please wait.", self); self.p = ProgressBar(self.dlg)
-            self.dlg.viewLayout.addWidget(self.p); self.dlg.yesButton.hide(); self.dlg.show()
-            self.w = UpdateWorker(u); self.w.progress.connect(self.p.setValue); self.w.finished.connect(lambda p: [subprocess.Popen([p, "/SILENT"]), sys.exit()]); self.w.start()
+
+    def prompt_update(self, version, url):
+        msg = MessageBox("Update Found! 🚀", f"Version {version} is available. Install now?", self)
+        msg.yesButton.setText("Update Now")
+        msg.cancelButton.setText("Later")
+        if msg.exec():
+            self.start_download(url)
+
+    def start_download(self, url):
+        self.dl_dialog = MessageBox("Downloading Update...", "Please wait while we prepare the new version.", self)
+        self.p_bar = ProgressBar(self.dl_dialog)
+        self.p_bar.setFixedHeight(4)
+        self.dl_dialog.viewLayout.addWidget(self.p_bar)
+        self.dl_dialog.yesButton.hide()
+        
+        self.updater_worker = UpdateWorker(url)
+        self.updater_worker.progress.connect(self.p_bar.setValue)
+        self.updater_worker.finished.connect(self.install_update)
+        self.updater_worker.start()
+        self.dl_dialog.show()
+
+    def install_update(self, installer_path):
+        self.dl_dialog.close()
+        if os.path.exists(installer_path):
+            try:
+                subprocess.Popen(
+                    [installer_path, "/SILENT", "/SP-", "/SUPPRESSMSGBOXES"],
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True
+                )
+                QApplication.quit()
+            except Exception as e:
+                InfoBar.error("Update Error", f"Could not launch installer: {e}", parent=self)
 
 if __name__ == "__main__":
     qInstallMessageHandler(qt_message_handler)

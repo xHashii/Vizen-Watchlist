@@ -2,10 +2,18 @@ import sqlite3
 import json
 import time
 import os
+import sys
 
 class DatabaseHandler:
     def __init__(self):
-        self.app_folder = os.path.join(os.environ['LOCALAPPDATA'], 'Vizen')
+        # Universal path logic
+        if sys.platform == 'win32':
+            self.app_folder = os.path.join(os.environ['LOCALAPPDATA'], 'Vizen')
+        elif sys.platform == 'darwin': # macOS
+            self.app_folder = os.path.expanduser('~/Library/Application Support/Vizen')
+        else: # Linux
+            self.app_folder = os.path.expanduser('~/.local/share/Vizen')
+
         if not os.path.exists(self.app_folder):
             os.makedirs(self.app_folder)
             

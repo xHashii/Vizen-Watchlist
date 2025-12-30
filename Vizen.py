@@ -16,7 +16,7 @@ from api_handler import TMDBService
 from database import DatabaseHandler
 
 # --- GLOBALS & CONSTANTS ---
-CURRENT_VERSION = "1.2.1"
+CURRENT_VERSION = "1.2.2"
 GITHUB_REPO = "xHashii/Vizen-Watchlist"
 IMAGE_CACHE = {}  
 AMOLED_MODE = False 
@@ -121,10 +121,8 @@ class ImageWorker(QRunnable):
 
     def _safe_emit(self, image):
         try:
-            if self.signals:
-                self.signals.result.emit(image, self.url)
-        except RuntimeError:
-            pass 
+            self.signals.result.emit(image, self.url)
+        except RuntimeError: pass 
 
 # --- UI COMPONENTS ---
 
@@ -204,7 +202,8 @@ class DramaCard(CardWidget):
         l = QVBoxLayout(self); l.setContentsMargins(10,10,10,10); l.setSpacing(8)
         self.img = BodyLabel(self); self.img.setFixedSize(190, 260); self.img.setStyleSheet("border-radius:8px;background:#0d0d0d;")
         if d.get('poster'):
-            w = ImageWorker(d['poster'], 190, 260); w.signals.result.connect(self._set_image_safe)
+            w = ImageWorker(d['poster'], 190, 260)
+            w.signals.result.connect(self._set_image_safe)
             QThreadPool.globalInstance().start(w)
         l.addWidget(self.img)
         if is_lib:
@@ -224,17 +223,21 @@ class DramaCard(CardWidget):
             self.dbtn = TransparentToolButton(FIF.DELETE, self); self.dbtn.clicked.connect(lambda: [self.db.delete_drama(self.data['id']), self.on_refresh() if self.on_refresh else None]); l.addWidget(self.dbtn, 0, Qt.AlignCenter)
 
     def _set_image_safe(self, image, url):
-        if not self.img.isHidden(): self.img.setPixmap(QPixmap.fromImage(image))
+        try:
+            if not self.img.isHidden(): self.img.setPixmap(QPixmap.fromImage(image))
+        except RuntimeError: pass
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             clicked_widget = self.childAt(e.position().toPoint())
             if clicked_widget in [self.img, self.title, None]: self.fetch_details()
         super().mousePressEvent(e)
+
     def fetch_details(self):
         self.dw = DetailWorker(self.tmdb, self.data['id'])
         self.dw.finished.connect(lambda d: InfoDialog(d, self.window()).exec())
         self.dw.start()
+
     def update_style(self): self.setStyleSheet(f"DramaCard{{background:{get_card_bg()};border:1px solid #333;border-radius:12px;}} DramaCard:hover{{border:1px solid {ACCENT_PINK};}}")
     def update_pb(self):
         t, c = self.data.get('total_eps', 0), self.data.get('current_ep', 0)
@@ -265,45 +268,26 @@ class DramaCard(CardWidget):
 # --- INTERFACES ---
 class BaseInterface(QFrame):
     def __init__(self, db, tmdb, obj_name, parent=None):
-        super().__init__(parent=parent)
-        self.setObjectName(obj_name)
-        self.db, self.tmdb = db, tmdb
-        
-        # Use a consistent layout name
+        super().__init__(parent=parent); self.setObjectName(obj_name); self.db, self.tmdb = db, tmdb
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(30, 30, 30, 30) 
+        self.main_layout.setContentsMargins(15, 30, 15, 80) 
         self.main_layout.setSpacing(20)
         
-        # Scroll Area
-        self.sa = SmoothScrollArea(self)
-        self.sa.setWidgetResizable(True)
-        self.sa.setStyleSheet("background:transparent; border:none;")
-        
-        self.container = QWidget()
-        self.container.setStyleSheet("background:transparent;")
-        self.flow = FlowLayout(self.container)
-        self.flow.setContentsMargins(0, 0, 0, 0)
-        self.flow.setHorizontalSpacing(15)
-        self.flow.setVerticalSpacing(25)
-        self.sa.setWidget(self.container)
+        self.sa = SmoothScrollArea(self); self.sa.setWidgetResizable(True); self.sa.setStyleSheet("background:transparent;border:none;")
+        self.container = QWidget(); self.container.setStyleSheet("background:transparent;")
+        self.flow = FlowLayout(self.container); self.flow.setContentsMargins(0,0,0,0); self.flow.setHorizontalSpacing(12); self.flow.setVerticalSpacing(25)
         
         self.emptyLabel = BodyLabel("No dramas found.", self) 
         self.emptyLabel.setAlignment(Qt.AlignCenter)
-        self.emptyLabel.setStyleSheet("color: #666; font-size: 20px; font-weight: bold; padding: 50px;")
+        self.emptyLabel.setStyleSheet("color: #666; font-size: 20px; font-weight: bold; background: transparent;")
         self.emptyLabel.hide()
         
-        self.main_layout.addWidget(self.emptyLabel, 1)
-        self.main_layout.addWidget(self.sa, 1)
-        
-        self.queue = []
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.process)
+        self.main_layout.addWidget(self.emptyLabel, 0, Qt.AlignCenter)
+        self.main_layout.addWidget(self.sa)
+        self.queue = []; self.timer = QTimer(self); self.timer.timeout.connect(self.process)
 
     def start_loading(self, items, is_lib=False, cb=None):
-        self.timer.stop()
-        self.queue = items
-        self.is_lib, self.cb = is_lib, cb
-        
+        self.timer.stop(); self.queue = items; self.is_lib, self.cb = is_lib, cb
         while self.flow.count() > 0:
             it = self.flow.takeAt(0)
             widget = it.widget() if hasattr(it, 'widget') else it
@@ -315,62 +299,30 @@ class BaseInterface(QFrame):
         else:
             self.emptyLabel.hide()
             self.sa.show()
-            self.timer.start(5)
+        self.timer.start(5)
 
     def process(self):
-        if not self.queue:
-            self.timer.stop()
-            return
+        if not self.queue: self.timer.stop(); return
         self.flow.addWidget(DramaCard(self.queue.pop(0), self.db, self.tmdb, self.container, self.is_lib, self.cb))
 
 class BrowseInterface(BaseInterface):
     def __init__(self, db, tmdb, parent=None):
         super().__init__(db, tmdb, "browseInterface", parent)
-        
-        # Header
-        h = QHBoxLayout()
-        h.setContentsMargins(0, 0, 0, 10)
-        title = TitleLabel("Browse Asian Dramas", self)
-        h.addWidget(title)
-        h.addStretch(1)
-        
-        self.sb = SearchLineEdit(self)
-        self.sb.setPlaceholderText("Search TMDB...")
-        self.sb.setFixedWidth(400)
-        
-        self.sb.searchSignal.connect(self.search)
-        self.sb.returnPressed.connect(lambda: self.search(self.sb.text()))
-        
-        h.addWidget(self.sb)
-        self.main_layout.insertLayout(0, h)
-
+        h = QHBoxLayout(); h.setContentsMargins(10,0,10,0); h.addWidget(TitleLabel("Browse Asian Dramas")); h.addStretch(1)
+        self.sb = SearchLineEdit(self); self.sb.setPlaceholderText("Search TMDB..."); self.sb.setFixedWidth(350)
+        self.sb.searchSignal.connect(self.search); self.sb.returnPressed.connect(lambda: self.search(self.sb.text()))
+        h.addWidget(self.sb); self.main_layout.insertLayout(0, h)
     def search(self, q):
-        if q:
-            results = self.tmdb.search_dramas(q)
-            self.start_loading(results)
+        if q: self.start_loading(self.tmdb.search_dramas(q))
 
 class LibraryInterface(BaseInterface):
     def __init__(self, db, tmdb, parent=None):
         super().__init__(db, tmdb, "libraryInterface", parent)
-        
-        # Header
-        h = QHBoxLayout()
-        h.setContentsMargins(0, 0, 0, 10)
-        h.addWidget(TitleLabel("My Library", self))
-        h.addStretch(1)
+        h = QHBoxLayout(); h.setContentsMargins(10,0,10,0); h.addWidget(TitleLabel("My Library")); h.addStretch(1)
         self.main_layout.insertLayout(0, h)
-        
-        # Filter Bar
-        self.piv = SegmentedWidget(self)
-        self.piv.addItem("all", "All")
-        self.piv.addItem("watching", "Watching")
-        self.piv.addItem("plan", "Plan to Watch")
-        self.piv.addItem("completed", "Completed")
-        self.piv.setCurrentItem("all")
-        self.piv.currentItemChanged.connect(self.refresh)
-        
-        self.main_layout.insertWidget(1, self.piv, 0, Qt.AlignLeft)
-
+        self.piv = SegmentedWidget(self); [self.piv.addItem(k, k.title().replace('Plan', 'Plan to Watch')) for k in ["all", "watching", "plan", "completed"]]
+        self.piv.setCurrentItem("all"); self.piv.currentItemChanged.connect(self.refresh); self.main_layout.insertWidget(1, self.piv, 0, Qt.AlignLeft)
+    
     def refresh(self):
         status = self.piv.currentItem().text().replace('Plan to Watch', 'plan').lower()
         self.start_loading(self.db.get_library(status), True, self.refresh)

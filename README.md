@@ -3,8 +3,10 @@
 
 **The most elegant way to track your Asian Drama journey.**
 
-![Version](https://img.shields.io/badge/version-1.2.1-ff4da6?style=for-the-badge)
-![Platform](https://img.shields.io/badge/platform-windows-00a2ed?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.2.2-ff4da6?style=for-the-badge)
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![macOS](https://img.shields.io/badge/mac%20os-000000?style=for-the-badge&logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 Vizen is a high-performance desktop application built for drama enthusiasts. Whether you are into K-Dramas, J-Dramas, C-Dramas, or Thai Lakorns, Vizen provides a buttery-smooth interface to search, track, and rate your favorite shows.

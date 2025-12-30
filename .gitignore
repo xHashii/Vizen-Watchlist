@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+env/
+venv/
+ENV/
+
+# Database and Config (CRITICAL: Do not upload your API key!)
+dramas.db
+config.json
+test.json
+
+# Build and Dist
+build/
+dist/
+*.spec
+
+# Local user files
+.vscode/
+.idea/

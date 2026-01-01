@@ -3,7 +3,7 @@
 
 **The most elegant way to track your Asian Drama journey.**
 
-![Version](https://img.shields.io/badge/version-1.2.4-ff4da6?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.2.5-ff4da6?style=for-the-badge)
 ![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![macOS](https://img.shields.io/badge/mac%20os-000000?style=for-the-badge&logo=apple&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)

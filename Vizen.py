@@ -16,7 +16,7 @@ from api_handler import TMDBService
 from database import DatabaseHandler
 
 # --- GLOBALS ---
-CURRENT_VERSION = "1.2.4"
+CURRENT_VERSION = "1.2.5"
 GITHUB_REPO = "xHashii/Vizen-Watchlist"
 IMAGE_CACHE = {}  
 AMOLED_MODE = False 
@@ -63,22 +63,40 @@ def get_cached_pixmap(url, w, h):
 class UpdateWorker(QThread):
     finished = Signal(str)
     progress = Signal(int)
+    failed = Signal(str)  # New signal for error reporting
+
     def __init__(self, url):
-        super().__init__(); self.url = url
+        super().__init__()
+        self.url = url
+
     def run(self):
         try:
             timestamp = int(time.time())
-            path = os.path.join(os.environ['TEMP'], f"Vizen_Setup_{timestamp}.exe")
-            response = requests.get(self.url, stream=True, timeout=30)
+            path = os.path.join(os.environ.get('TEMP', os.getcwd()), f"Vizen_Setup_{timestamp}.exe")
+            
+            # Added headers to mimic a browser (prevents some blocks)
+            headers = {'User-Agent': 'Mozilla/5.0 Vizen-Updater'}
+            response = requests.get(self.url, stream=True, timeout=60, headers=headers)
+            response.raise_for_status() # Raise error for 404/500
+            
             total = int(response.headers.get('content-length', 0))
             dl = 0
+            
             with open(path, 'wb') as f:
-                for chunk in response.iter_content(8192):
+                for chunk in response.iter_content(chunk_size=16384):
                     if chunk:
-                        dl += len(chunk); f.write(chunk)
-                        if total: self.progress.emit(int((dl / total) * 100))
-            self.finished.emit(path)
-        except: pass
+                        f.write(chunk)
+                        dl += len(chunk)
+                        if total > 0:
+                            self.progress.emit(int((dl / total) * 100))
+            
+            # Verify the file exists and isn't just an empty shell
+            if os.path.exists(path) and os.path.getsize(path) > 100000:
+                self.finished.emit(path)
+            else:
+                self.failed.emit("Downloaded file is invalid or incomplete.")
+        except Exception as e:
+            self.failed.emit(str(e))
 
 class UpdateChecker(QThread):
     update_available = Signal(str, str)
@@ -223,6 +241,27 @@ class InfoDialog(MessageBoxBase):
         for child in self.widget.findChildren(QFrame):
             if child.height() <= 3: child.hide()
         self.viewLayout.setContentsMargins(25, 25, 25, 15); apply_font_guard(self)
+
+class UpdateDialog(MessageBoxBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel("Downloading Update...", self)
+        self.contentLabel = BodyLabel("Please wait while we fetch the latest version.", self)
+        self.p = ProgressBar(self)
+        self.p.setFixedHeight(4)
+        self.p.setValue(0)
+
+        # Add widgets to the layout
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.contentLabel)
+        self.viewLayout.addWidget(self.p)
+
+        # Configure buttons
+        self.yesButton.hide() # Hide 'OK' until finished if you want, or keep hidden
+        self.cancelButton.setText("Cancel")
+        
+        self.widget.setMinimumWidth(400)
+        apply_font_guard(self)
 
 class HeartRating(QWidget):
     valueChanged = Signal(int)
@@ -509,15 +548,45 @@ class VizenWindow(MSFluentWindow):
         msg = MessageBox("Update Found! 🚀", f"Version {v} is available. Install now?", self)
         msg.yesButton.setText("Update Now"); msg.cancelButton.setText("Later")
         if msg.exec(): self.start_download(u)
+
     def start_download(self, u):
-        self.dlg = MessageBox("Downloading Update...", "Please wait.", self); self.p = ProgressBar(self.dlg); self.p.setFixedHeight(4)
-        self.dlg.viewLayout.addWidget(self.p); self.dlg.yesButton.hide(); self.dlg.show()
-        self.updater_worker = UpdateWorker(u); self.updater_worker.progress.connect(self.p.setValue); self.updater_worker.finished.connect(self.install_update); self.updater_worker.start()
+        self.dlg = UpdateDialog(self)
+        self.dlg.show()
+
+        self.updater_worker = UpdateWorker(u)
+        self.updater_worker.progress.connect(self.dlg.p.setValue)
+        self.updater_worker.finished.connect(self.install_update)
+        self.updater_worker.failed.connect(self.handle_update_error)
+        self.updater_worker.start()
+        
+        # If user clicks cancel, stop the worker
+        self.dlg.cancelButton.clicked.connect(self.updater_worker.terminate)
+
+    def handle_update_error(self, err):
+        if hasattr(self, 'dlg'):
+            self.dlg.close()
+        InfoBar.error(
+            title="Update Failed",
+            content=f"Error: {err}. Please try manual download.",
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=7000,
+            parent=self
+        )
+
     def install_update(self, p):
         self.dlg.close()
         if os.path.exists(p):
-            subprocess.Popen([p, "/SILENT", "/SP-", "/SUPPRESSMSGBOXES"], creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)
-            QApplication.quit()
+            try:
+                os.startfile(p)
+                QApplication.quit()
+            except Exception as e:
+                try:
+                    subprocess.Popen([p], creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+                    QApplication.quit()
+                except:
+                    InfoBar.error("Error", f"Failed to launch installer: {e}", parent=self)
 
 if __name__ == "__main__":
     qInstallMessageHandler(qt_message_handler)

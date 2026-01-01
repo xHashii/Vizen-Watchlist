@@ -28,32 +28,50 @@ class DatabaseHandler:
                 tmdb_id INTEGER PRIMARY KEY,
                 title TEXT, poster_url TEXT, status TEXT,
                 current_ep INTEGER DEFAULT 0, total_eps INTEGER DEFAULT 0, 
-                year TEXT, rating INTEGER DEFAULT 0, last_updated INTEGER DEFAULT 0
+                year TEXT, rating INTEGER DEFAULT 0, last_updated INTEGER DEFAULT 0,
+                genres TEXT DEFAULT "",
+                origin_country TEXT DEFAULT ""
             )
         ''')
+        # Migrations
         try: cursor.execute('ALTER TABLE dramas ADD COLUMN rating INTEGER DEFAULT 0')
         except: pass
         try: cursor.execute('ALTER TABLE dramas ADD COLUMN last_updated INTEGER DEFAULT 0')
         except: pass
+        try: cursor.execute('ALTER TABLE dramas ADD COLUMN genres TEXT DEFAULT ""')
+        except: pass
+        try: cursor.execute('ALTER TABLE dramas ADD COLUMN origin_country TEXT DEFAULT ""')
+        except: pass
         self.conn.commit()
 
-    def get_library(self, status_filter="all", search_q=""):
+    def get_library(self, status_filter="all", search_q="", genre_filter="All Genres", country_filter="All Regions"):
         cur = self.conn.cursor()
         query = "SELECT * FROM dramas"
         params = []
         conditions = []
-        if status_filter != "all":
+
+        if status_filter and status_filter != "all":
             conditions.append("status = ?")
             params.append(status_filter)
         if search_q:
             conditions.append("title LIKE ?")
             params.append(f"%{search_q}%")
+        if genre_filter and genre_filter != "All Genres":
+            conditions.append("genres LIKE ?")
+            params.append(f"%{genre_filter}%")
+        if country_filter and country_filter != "All Regions":
+            conditions.append("origin_country LIKE ?")
+            params.append(f"%{country_filter}%")
+            
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
+            
         query += " ORDER BY last_updated DESC"
         cur.execute(query, params)
+        # Note: origin_country is index 10
         return [{"id": d[0], "title": d[1], "poster": d[2], "status": d[3], 
-                 "current_ep": d[4], "total_eps": d[5], "year": d[6], "rating": d[7]} for d in cur.fetchall()]
+                "current_ep": d[4], "total_eps": d[5], "year": d[6], 
+                "rating": d[7], "genres": d[9], "country": d[10]} for d in cur.fetchall()]
 
     def update_rating(self, tmdb_id, rating):
         cursor = self.conn.cursor()
@@ -62,10 +80,14 @@ class DatabaseHandler:
 
     def add_drama(self, d, status, current_ep=0):
         cursor = self.conn.cursor()
+        genres_str = ",".join(d.get('genres', []))
+        # Extract country from API data (TMDB returns a list)
+        country = d.get('origin_country', [""])[0] if isinstance(d.get('origin_country'), list) else d.get('origin_country', "")
+        
         cursor.execute('''
-            INSERT OR REPLACE INTO dramas (tmdb_id, title, poster_url, status, current_ep, total_eps, year, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (d['id'], d['title'], d['poster'], status, current_ep, d.get('total_eps', 0), d['year'], int(time.time())))
+            INSERT OR REPLACE INTO dramas (tmdb_id, title, poster_url, status, current_ep, total_eps, year, last_updated, genres, origin_country)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (d['id'], d['title'], d['poster'], status, current_ep, d.get('total_eps', 0), d['year'], int(time.time()), genres_str, country))
         self.conn.commit()
 
     def update_episode(self, tmdb_id, new_ep):
@@ -79,6 +101,12 @@ class DatabaseHandler:
         cursor.execute('UPDATE dramas SET status = ?, current_ep = ?, last_updated = ? WHERE tmdb_id = ?', 
                        (status, current_ep, int(time.time()), tmdb_id))
         self.conn.commit()
+
+    def get_incomplete_dramas(self):
+        cursor = self.conn.cursor()
+        # Find dramas where genres are empty OR country is empty
+        cursor.execute("SELECT tmdb_id FROM dramas WHERE genres = '' OR origin_country = '' OR origin_country IS NULL")
+        return [row[0] for row in cursor.fetchall()]
 
     def delete_drama(self, tmdb_id):
         cursor = self.conn.cursor()

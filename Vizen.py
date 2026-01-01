@@ -5,7 +5,7 @@ from PySide6.QtWidgets import QApplication, QFrame, QVBoxLayout, QHBoxLayout, QW
 
 from qfluentwidgets import (MSFluentWindow, NavigationItemPosition, TitleLabel, 
                             CaptionLabel, SearchLineEdit, FlowLayout, SegmentedWidget, 
-                            FluentIcon as FIF, CardWidget, BodyLabel, PushButton, 
+                            FluentIcon as FIF, CardWidget, ComboBox, BodyLabel, PushButton, 
                             SmoothScrollArea, RoundMenu, Action, SubtitleLabel, 
                             TextBrowser, MessageBox, setTheme, Theme, 
                             TransparentToolButton, InfoBar, InfoBarPosition, ProgressBar, 
@@ -16,7 +16,7 @@ from api_handler import TMDBService
 from database import DatabaseHandler
 
 # --- GLOBALS ---
-CURRENT_VERSION = "1.2.3"
+CURRENT_VERSION = "1.2.4"
 GITHUB_REPO = "xHashii/Vizen-Watchlist"
 IMAGE_CACHE = {}  
 AMOLED_MODE = False 
@@ -42,57 +42,83 @@ def apply_font_guard(widget):
     widget.setFont(f)
     for child in widget.findChildren(QWidget): child.setFont(f)
 
-# --- UPDATER ENGINE (BULLETPROOF VERSION) ---
+def get_cached_pixmap(url, w, h):
+    """Checks memory and disk cache synchronously. Returns QPixmap or None."""
+    if not url: return None
+    if url in IMAGE_CACHE:
+        return QPixmap.fromImage(IMAGE_CACHE[url])
+    
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    cache_path = os.path.join(CACHE_DIR, f"{url_hash}.jpg")
+    
+    if os.path.exists(cache_path):
+        img = QImage(cache_path)
+        if not img.isNull():
+            scaled = img.scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            IMAGE_CACHE[url] = scaled
+            return QPixmap.fromImage(scaled)
+    return None
 
+# --- UPDATER ENGINE ---
 class UpdateWorker(QThread):
     finished = Signal(str)
     progress = Signal(int)
-    
     def __init__(self, url):
-        super().__init__()
-        self.url = url
-
+        super().__init__(); self.url = url
     def run(self):
         try:
-            # Use a unique filename to avoid "File in use" errors
             timestamp = int(time.time())
             path = os.path.join(os.environ['TEMP'], f"Vizen_Setup_{timestamp}.exe")
-            
             response = requests.get(self.url, stream=True, timeout=30)
             total = int(response.headers.get('content-length', 0))
-            
             dl = 0
             with open(path, 'wb') as f:
                 for chunk in response.iter_content(8192):
                     if chunk:
-                        dl += len(chunk)
-                        f.write(chunk)
-                        if total:
-                            self.progress.emit(int((dl / total) * 100))
-            
+                        dl += len(chunk); f.write(chunk)
+                        if total: self.progress.emit(int((dl / total) * 100))
             self.finished.emit(path)
-        except Exception as e:
-            print(f"Download failed: {e}")
+        except: pass
 
 class UpdateChecker(QThread):
-    update_available = Signal(str, str) # version, url
-
+    update_available = Signal(str, str)
     def run(self):
         try:
-            # Numerical comparison logic (1.2.10 > 1.2.2)
             res = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=10).json()
             tag = res['tag_name']
-            remote_v_str = tag.replace('v', '')
-            
-            remote_v_map = list(map(int, remote_v_str.split('.')))
-            local_v_map = list(map(int, CURRENT_VERSION.split('.')))
-
-            if remote_v_map > local_v_map:
-                for asset in res['assets']:
-                    if asset['name'].endswith('.exe'):
-                        self.update_available.emit(remote_v_str, asset['browser_download_url'])
-                        return
+            new_v_str = tag.replace('v', '')
+            remote_v = list(map(int, new_v_str.split('.')))
+            local_v = list(map(int, CURRENT_VERSION.split('.')))
+            if remote_v > local_v:
+                for a in res['assets']:
+                    if a['name'].endswith('.exe'):
+                        self.update_available.emit(new_v_str, a['browser_download_url']); return
         except: pass
+
+class MigrationWorker(QThread):
+    finished = Signal()
+    def __init__(self, db, tmdb):
+        super().__init__()
+        self.db = db
+        self.tmdb = tmdb
+
+    def run(self):
+        incomplete_ids = self.db.get_incomplete_dramas()
+        if not incomplete_ids:
+            return
+
+        for tid in incomplete_ids:
+            detail = self.tmdb.get_detailed_info(tid)
+            if detail:
+                # We fetch existing status/ep from DB so we don't overwrite them
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT status, current_ep FROM dramas WHERE tmdb_id = ?", (tid,))
+                row = cursor.fetchone()
+                if row:
+                    status, current_ep = row
+                    self.db.add_drama(detail, status, current_ep)
+            time.sleep(0.2) # Avoid hitting API rate limits
+        self.finished.emit()
 
 # --- IMAGE ENGINE ---
 class ImageWorkerSignals(QObject): result = Signal(QImage, str)
@@ -124,10 +150,19 @@ class ImageWorker(QRunnable):
 # --- UI COMPONENTS ---
 class DetailWorker(QThread):
     finished = Signal(dict)
-    def __init__(self, tmdb, tid): super().__init__(); self.tmdb, self.tid = tmdb, tid
+    def __init__(self, tmdb, tid): 
+        super().__init__()
+        self.tmdb, self.tid = tmdb, tid
+        
     def run(self):
         res = self.tmdb.get_detailed_info(self.tid)
-        if res: self.finished.emit(res)
+        if res:
+            if res.get('streaming'):
+                for s in res['streaming']:
+                    if s.get('logo'):
+                        worker = ImageWorker(s['logo'], 48, 48)
+                        worker.run()
+            self.finished.emit(res)
 
 class InfoDialog(MessageBoxBase):
     def __init__(self, d, parent=None):
@@ -139,13 +174,51 @@ class InfoDialog(MessageBoxBase):
         self.metaLabel.setStyleSheet(f"color: {ACCENT_YELLOW}; font-weight: bold; font-size: 13px; border: none;")
         self.content = TextBrowser(self)
         self.content.setMarkdown(f"**Cast:** {', '.join(d['cast'])}\n\n{d['overview']}")
-        self.content.setFixedHeight(280)
+        self.content.setFixedHeight(250)
         self.content.setStyleSheet("background: transparent; border: none; color: #d0d0d0; font-size: 14px;")
         self.content.setFrameStyle(QFrame.NoFrame) 
         self.viewLayout.addWidget(self.titleLabel); self.viewLayout.addWidget(self.metaLabel); self.viewLayout.addWidget(self.content)
+
+        if d.get('streaming'):
+            self.streamLabel = CaptionLabel("Watch on:", self)
+            self.streamLabel.setStyleSheet("border: none; font-weight: bold; color: white; margin-top: 10px;")
+            self.viewLayout.addWidget(self.streamLabel)
+            
+            self.stream_container = QWidget()
+            self.stream_container.setStyleSheet("background: transparent; border: none;")
+            stream_layout = QHBoxLayout(self.stream_container)
+            stream_layout.setContentsMargins(0, 5, 0, 5); stream_layout.setSpacing(15) # Increased spacing
+            
+            for s in d['streaming']:
+                if not s['logo']: continue
+                btn = TransparentToolButton(self)
+                btn.setToolTip(s['name'])
+                
+                
+                btn.setFixedSize(56, 56)
+                btn.setIconSize(QSize(48, 48))
+                
+                
+                btn.clicked.connect(lambda checked, url=s['url']: QDesktopServices.openUrl(QUrl(url)))
+                
+                # Try cache first with new 48x48 size
+                cached_pix = get_cached_pixmap(s['logo'], 48, 48)
+                if cached_pix:
+                    btn.setIcon(QIcon(cached_pix))
+                else:
+                    # Fallback worker with new 48x48 size
+                    logo_worker = ImageWorker(s['logo'], 48, 48)
+                    logo_worker.signals.result.connect(lambda img, u, b=btn: b.setIcon(QIcon(QPixmap.fromImage(img))))
+                    QThreadPool.globalInstance().start(logo_worker)
+                
+                stream_layout.addWidget(btn)
+            
+            stream_layout.addStretch(1)
+            self.viewLayout.addWidget(self.stream_container)
+
         self.yesButton.setText("Close"); self.yesButton.setFixedWidth(120); self.yesButton.setFocusPolicy(Qt.NoFocus)
         self.yesButton.setStyleSheet(f"PushButton {{ background-color: #20f0ff; color: black; border: none; border-radius: 8px; font-weight: bold; height: 32px; }} PushButton:hover {{ background-color: #1ad8e6; }}")
-        self.cancelButton.hide()
+        self.cancelButton.hide(); self.cancelButton.setEnabled(False)
         self.widget.setStyleSheet(f"QWidget {{ background-color: {get_card_bg()}; border: 1px solid {ACCENT_PINK}; border-radius: 12px; }} #buttonGroup {{ border: none; background: transparent; }}")
         for child in self.widget.findChildren(QFrame):
             if child.height() <= 3: child.hide()
@@ -205,7 +278,10 @@ class DramaCard(CardWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             clicked_widget = self.childAt(e.position().toPoint())
-            if clicked_widget in [self.img, self.title, None]:
+            ignore = [self.btn]
+            if hasattr(self, 'dbtn'): ignore.append(self.dbtn)
+            if hasattr(self, 'ee'): ignore.append(self.ee)
+            if clicked_widget not in ignore:
                 self.dw = DetailWorker(self.tmdb, self.data['id'])
                 self.dw.finished.connect(lambda d: InfoDialog(d, self.window()).exec())
                 self.dw.start()
@@ -242,46 +318,50 @@ class DramaCard(CardWidget):
 class BaseInterface(QFrame):
     def __init__(self, db, tmdb, obj_name, parent=None):
         super().__init__(parent=parent); self.setObjectName(obj_name); self.db, self.tmdb = db, tmdb
-        
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(30, 30, 30, 30)
-        self.main_layout.setSpacing(20)
-        
+        self.main_layout.setContentsMargins(15, 30, 15, 80); self.main_layout.setSpacing(20)
         self.header_layout = QVBoxLayout()
         self.main_layout.addLayout(self.header_layout)
-        
         self.sa = SmoothScrollArea(self); self.sa.setWidgetResizable(True); self.sa.setStyleSheet("background:transparent;border:none;")
         self.container = QWidget(); self.container.setStyleSheet("background:transparent;")
         self.flow = FlowLayout(self.container); self.flow.setContentsMargins(0,0,0,0); self.flow.setHorizontalSpacing(12); self.flow.setVerticalSpacing(25)
         self.sa.setWidget(self.container)
-        
         self.emptyLabel = BodyLabel("No dramas found.", self) 
-        self.emptyLabel.setAlignment(Qt.AlignCenter)
-        self.emptyLabel.setStyleSheet("color: #666; font-size: 20px; font-weight: bold; background: transparent;")
-        self.emptyLabel.hide()
-        
+        self.emptyLabel.setAlignment(Qt.AlignCenter); self.emptyLabel.setStyleSheet("color: #666; font-size: 20px; font-weight: bold; background: transparent;"); self.emptyLabel.hide()
         self.main_layout.addWidget(self.emptyLabel, 1)
         self.main_layout.addWidget(self.sa, 1)
-        
+        self.current_page = 1; self.total_pages = 1; self.is_loading_more = False
+        self.last_query = None; self.last_genre = None; self.last_country = None
+        self.sa.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self.queue = []; self.timer = QTimer(self); self.timer.timeout.connect(self.process)
 
-    def start_loading(self, items, is_lib=False, cb=None):
-        self.timer.stop(); self.queue = items; self.is_lib, self.cb = is_lib, cb
-        while self.flow.count() > 0:
-            it = self.flow.takeAt(0)
-            w = it.widget() if hasattr(it, 'widget') else it
-            if w: w.deleteLater()
-        
-        if not items:
-            self.sa.hide()
-            self.emptyLabel.show()
+    def _on_scroll(self, value):
+        if value > self.sa.verticalScrollBar().maximum() * 0.9 and not self.is_loading_more:
+            if self.current_page < self.total_pages: self.load_next_page()
+
+    def load_next_page(self):
+        self.is_loading_more = True
+        self.current_page += 1
+        if hasattr(self, 'search'): self.search(self.last_query, append=True)
+
+    def start_loading(self, items, is_lib=False, cb=None, append=False):
+        self.timer.stop(); self.is_lib, self.cb = is_lib, cb
+        if not append:
+            self.queue = items
+            while self.flow.count() > 0:
+                it = self.flow.takeAt(0)
+                w = it.widget() if hasattr(it, 'widget') else it
+                if w: w.deleteLater()
         else:
-            self.emptyLabel.hide()
-            self.sa.show()
-            self.timer.start(5)
+            self.queue.extend(items)
+        if not items and not append: self.sa.hide(); self.emptyLabel.show()
+        else: self.emptyLabel.hide(); self.sa.show(); self.timer.start(5)
 
     def process(self):
-        if not self.queue: self.timer.stop(); return
+        if not self.queue: 
+            self.timer.stop()
+            self.is_loading_more = False
+            return
         self.flow.addWidget(DramaCard(self.queue.pop(0), self.db, self.tmdb, self.container, self.is_lib, self.cb))
 
 class BrowseInterface(BaseInterface):
@@ -290,29 +370,67 @@ class BrowseInterface(BaseInterface):
         h = QHBoxLayout()
         h.addWidget(TitleLabel("Browse Asian Dramas"))
         h.addStretch(1)
+        self.genreCombo = ComboBox(self); self.genreCombo.addItem("All Genres", userData=None)
+        for name, val in self.tmdb.genre_map.items(): self.genreCombo.addItem(name, userData=val)
+        self.genreCombo.currentIndexChanged.connect(lambda: self.search(self.sb.text()))
+        self.countryCombo = ComboBox(self); self.countryCombo.addItems(["All Regions", "KR", "JP", "CN", "TH", "TW"])
+        self.countryCombo.currentIndexChanged.connect(lambda: self.search(self.sb.text()))
         self.sb = SearchLineEdit(self); self.sb.setPlaceholderText("Search TMDB..."); self.sb.setFixedWidth(350)
         self.sb.searchSignal.connect(self.search)
         self.sb.returnPressed.connect(lambda: self.search(self.sb.text()))
-        h.addWidget(self.sb)
+        h.addWidget(self.genreCombo); h.addWidget(self.countryCombo); h.addWidget(self.sb)
         self.header_layout.addLayout(h)
 
-    def search(self, q):
-        if q: self.start_loading(self.tmdb.search_dramas(q))
+    def search(self, q, append=False):
+        if not append:
+            self.current_page = 1; self.last_query = q
+            self.last_genre = self.genreCombo.currentData()
+            self.last_country = self.countryCombo.currentText() if self.countryCombo.currentText() != "All Regions" else None
+        results, total = self.tmdb.search_dramas(self.last_query, self.last_genre, self.last_country, self.current_page)
+        self.total_pages = total
+        self.start_loading(results, append=append)
+
+    def load_next_page(self):
+        self.search(self.last_query, append=True)
 
 class LibraryInterface(BaseInterface):
     def __init__(self, db, tmdb, parent=None):
         super().__init__(db, tmdb, "libraryInterface", parent)
-        self.header_layout.addWidget(TitleLabel("My Library"))
-        self.piv = SegmentedWidget(self)
-        for k in ["all", "watching", "plan", "completed"]:
-            self.piv.addItem(k, k.title().replace('Plan', 'Plan to Watch'))
-        self.piv.setCurrentItem("all")
-        self.piv.currentItemChanged.connect(self.refresh)
-        self.header_layout.addWidget(self.piv, 0, Qt.AlignLeft)
+        h = QHBoxLayout()
+        h.addWidget(TitleLabel("My Library"))
+        h.addStretch(1)
+        
+        # Genre Filter
+        self.libGenreCombo = ComboBox(self); self.libGenreCombo.setFixedWidth(150); self.libGenreCombo.addItem("All Genres")
+        for name in self.tmdb.genre_map.keys(): self.libGenreCombo.addItem(name)
+        self.libGenreCombo.currentIndexChanged.connect(self.refresh)
+        
+        # Country Filter (NEW)
+        self.libCountryCombo = ComboBox(self); self.libCountryCombo.setFixedWidth(120); self.libCountryCombo.addItem("All Regions")
+        self.libCountryCombo.addItems(["KR", "JP", "CN", "TH", "TW"])
+        self.libCountryCombo.currentIndexChanged.connect(self.refresh)
+
+        self.libSearch = SearchLineEdit(self); self.libSearch.setPlaceholderText("Search list..."); self.libSearch.setFixedWidth(200)
+        self.libSearch.textChanged.connect(self.refresh)
+        
+        h.addWidget(self.libGenreCombo); h.addWidget(self.libCountryCombo); h.addWidget(self.libSearch)
+        self.header_layout.addLayout(h)
+        self.piv = SegmentedWidget(self); [self.piv.addItem(k, k.title().replace('Plan', 'Plan to Watch')) for k in ["all", "watching", "plan", "completed"]]
+        self.piv.setCurrentItem("all"); self.piv.currentItemChanged.connect(self.refresh); self.header_layout.addWidget(self.piv, 0, Qt.AlignLeft)
 
     def refresh(self):
         status = self.piv.currentItem().text().replace('Plan to Watch', 'plan').lower()
-        self.start_loading(self.db.get_library(status), True, self.refresh)
+        search_q = self.libSearch.text().lower()
+        genre_q = self.libGenreCombo.currentText()
+        country_q = self.libCountryCombo.currentText() # NEW
+        
+        items = self.db.get_library(
+            status_filter=status, 
+            search_q=search_q, 
+            genre_filter=genre_q, 
+            country_filter=country_q
+        )
+        self.start_loading(items, True, self.refresh)
 
     def export_data(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Backup", "", "JSON (*.json)")
@@ -359,7 +477,6 @@ class SettingsInterface(SmoothScrollArea):
             with open(path, "w") as f: json.dump({"api_key": t}, f)
             InfoBar.success("Success", "Restart app to apply.", parent=self.window())
 
-# --- MAIN WINDOW ---
 class VizenWindow(MSFluentWindow):
     def __init__(self):
         super().__init__(); setTheme(Theme.DARK); self.db, self.tmdb = DatabaseHandler(), TMDBService()
@@ -373,51 +490,34 @@ class VizenWindow(MSFluentWindow):
         self.setWindowTitle("Vizen Watchlist"); self.resize(1300, 850); self.center(); self.apply_theme()
         self.stackedWidget.currentChanged.connect(lambda i: self.library.refresh() if i==1 else None)
         self.check_updates()
-
+        self.run_migration()
+    def run_migration(self):
+        self.migrator = MigrationWorker(self.db, self.tmdb)
+        # Refresh library once migration finishes so user sees the updated data
+        self.migrator.finished.connect(lambda: self.library.refresh())
+        self.migrator.start()
     def center(self):
         cp = QApplication.primaryScreen().availableGeometry().center()
         qr = self.frameGeometry(); qr.moveCenter(cp); self.move(qr.topLeft())
-
     def apply_theme(self):
         bg = get_bg(); self.setStyleSheet(f"MSFluentWindow, QStackedWidget {{ background: {bg}; }}")
         [x.setStyleSheet(f"background:{bg};border:none;") for x in [self.browse, self.library, self.settings.view]]
         for c in self.findChildren(DramaCard): c.update_style()
-
     def check_updates(self):
         self.checker = UpdateChecker(self); self.checker.update_available.connect(self.prompt_update); self.checker.start()
-
-    def prompt_update(self, version, url):
-        msg = MessageBox("Update Found! 🚀", f"Version {version} is available. Install now?", self)
-        msg.yesButton.setText("Update Now")
-        msg.cancelButton.setText("Later")
-        if msg.exec():
-            self.start_download(url)
-
-    def start_download(self, url):
-        self.dl_dialog = MessageBox("Downloading Update...", "Please wait while we prepare the new version.", self)
-        self.p_bar = ProgressBar(self.dl_dialog)
-        self.p_bar.setFixedHeight(4)
-        self.dl_dialog.viewLayout.addWidget(self.p_bar)
-        self.dl_dialog.yesButton.hide()
-        
-        self.updater_worker = UpdateWorker(url)
-        self.updater_worker.progress.connect(self.p_bar.setValue)
-        self.updater_worker.finished.connect(self.install_update)
-        self.updater_worker.start()
-        self.dl_dialog.show()
-
-    def install_update(self, installer_path):
-        self.dl_dialog.close()
-        if os.path.exists(installer_path):
-            try:
-                subprocess.Popen(
-                    [installer_path, "/SILENT", "/SP-", "/SUPPRESSMSGBOXES"],
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                    close_fds=True
-                )
-                QApplication.quit()
-            except Exception as e:
-                InfoBar.error("Update Error", f"Could not launch installer: {e}", parent=self)
+    def prompt_update(self, v, u):
+        msg = MessageBox("Update Found! 🚀", f"Version {v} is available. Install now?", self)
+        msg.yesButton.setText("Update Now"); msg.cancelButton.setText("Later")
+        if msg.exec(): self.start_download(u)
+    def start_download(self, u):
+        self.dlg = MessageBox("Downloading Update...", "Please wait.", self); self.p = ProgressBar(self.dlg); self.p.setFixedHeight(4)
+        self.dlg.viewLayout.addWidget(self.p); self.dlg.yesButton.hide(); self.dlg.show()
+        self.updater_worker = UpdateWorker(u); self.updater_worker.progress.connect(self.p.setValue); self.updater_worker.finished.connect(self.install_update); self.updater_worker.start()
+    def install_update(self, p):
+        self.dlg.close()
+        if os.path.exists(p):
+            subprocess.Popen([p, "/SILENT", "/SP-", "/SUPPRESSMSGBOXES"], creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)
+            QApplication.quit()
 
 if __name__ == "__main__":
     qInstallMessageHandler(qt_message_handler)
